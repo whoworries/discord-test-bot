@@ -1,0 +1,4 @@
+# Install with:  venv/bin/pip install -r requirements.txt   (Windows: venv\Scripts\python -m pip install -r requirements.txt)
+discord.py[voice]==2.7.1
+python-dotenv==1.2.4
+edge-tts==7.3.1

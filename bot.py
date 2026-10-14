@@ -1,31 +1,55 @@
-import requests
 import random
 
 import os
+import sys
+import asyncio
+import aiohttp
+import tempfile
+import textwrap
+import json
+import datetime
+from pathlib import Path
+from typing import Literal, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
 import discord
-from discord.ext import commands
+from discord import app_commands
+from discord.ext import commands, tasks
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+
+async def setup_hook():
+    # Registers the / versions of the commands with Discord
+    synced = await bot.tree.sync()
+    print(f"Synced {len(synced)} slash commands")
+
+bot.setup_hook = setup_hook
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
+    if not seasonal_icon_check.is_running():
+        seasonal_icon_check.start()
+    if not twitch_check.is_running():
+        twitch_check.start()
+    await apply_saved_status()
 
-@bot.command()
+@bot.hybrid_command()
 async def hello(ctx):
+    """Says hi. Sort of."""
     await ctx.send("Leave me alone")
 
-@bot.command()
+@bot.hybrid_command()
 async def ping(ctx):
+    """Shows the bot's response time."""
     await ctx.send(f"Pong! 🏓 {round(bot.latency * 1000)}ms")
 
-@bot.command()
+@bot.hybrid_command()
 async def ben(ctx):
     """Shows our very own baby boy."""
     messages = [
@@ -42,7 +66,7 @@ async def ben(ctx):
     choice = random.choice(messages)
     await ctx.send(choice)
 
-@bot.command()
+@bot.hybrid_command()
 async def bugfact(ctx):
     """Teaches you a lesson about life."""
     facts = [
@@ -61,16 +85,17 @@ async def bugfact(ctx):
     await ctx.send(choice)
 
 
-@bot.command()
+@bot.hybrid_command()
 async def weather(ctx, *, city: str):
     """Get the current weather for a city."""
-    api_key = os.getenv("WEATHER_API_KEY")
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=imperial"
+    await ctx.defer()
+    params = {"q": city, "appid": os.getenv("WEATHER_API_KEY"), "units": "imperial"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://api.openweathermap.org/data/2.5/weather", params=params) as response:
+            ok = response.status == 200
+            data = await response.json() if ok else None
 
-    response = requests.get(url)
-    
-    if response.status_code == 200:
-        data = response.json()
+    if ok:
         weather_desc = data["weather"][0]["description"].title()
         temp = data["main"]["temp"]
         feels_like = data["main"]["feels_like"]
@@ -79,11 +104,1007 @@ async def weather(ctx, *, city: str):
         await ctx.send(
             f"🌤️ Weather in **{city.title()}**:\n"
             f"> **{weather_desc}**\n"
-            f"> Temperature: {temp}°C (feels like {feels_like}°C)\n"
+            f"> Temperature: {temp}°F (feels like {feels_like}°F)\n"
             f"> Humidity: {humidity}%"
         )
     else:
         await ctx.send("❌ Couldn't find that city. Please check the spelling and try again.")
 
+# ---------------- Holiday server icons ----------------
+# Put one image per season in the "icons" folder, named like icons/halloween.png
+# (.png, .jpg, .jpeg, .gif or .webp all work). The bot checks every hour and
+# swaps the server icon when a new season starts.
+
+ICON_DIR = Path(__file__).parent / "icons"
+STATE_FILE = Path(__file__).parent / "icon_state.json"
+
+SEASON_NAMES = {
+    "newyear": "New Year's",
+    "anniversary": "Server Anniversary",
+    "valentines": "Valentine's Day",
+    "stpatricks": "St. Patrick's Day",
+    "fourth": "4th of July",
+    "halloween": "Halloween",
+    "thanksgiving": "Thanksgiving",
+    "christmas": "Christmas",
+    "aprilfools": "April Fools' Day",
+    "easter": "Easter",
+    "summer": "Summer",
+    "default": "Normal",
+}
+
+
+def thanksgiving_date(year):
+    """4th Thursday of November."""
+    nov1 = datetime.date(year, 11, 1)
+    return nov1 + datetime.timedelta(days=(3 - nov1.weekday()) % 7 + 21)
+
+
+def easter_date(year):
+    """Easter Sunday (Western), using the standard Gregorian calculation."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return datetime.date(year, month, day + 1)
+
+
+def current_season(today=None):
+    """Works out which holiday season a date falls in."""
+    today = today or datetime.date.today()
+    md = (today.month, today.day)
+
+    if md >= (12, 26) or md == (1, 1):
+        return "newyear"          # Dec 26 - Jan 1
+    if md <= (1, 25):
+        return "anniversary"      # Jan 2 - Jan 25
+    if md <= (2, 14):
+        return "valentines"       # Jan 26 - Feb 14
+    if md < (3, 1):
+        return "default"          # Feb 15 - end of Feb
+    if md <= (3, 17):
+        return "stpatricks"       # Mar 1 - Mar 17
+    if md == (4, 1):
+        return "aprilfools"       # Apr 1 only (beats Easter if they overlap)
+    easter = easter_date(today.year)
+    if easter - datetime.timedelta(days=6) <= today <= easter:
+        return "easter"           # the week leading up to Easter Sunday
+    if md < (6, 20):
+        return "default"          # rest of Mar 18 - Jun 19
+    if md <= (7, 4):
+        return "fourth"           # Jun 20 - Jul 4
+    if md <= (7, 31):
+        return "summer"           # Jul 5 - Jul 31
+    if md < (10, 1):
+        return "default"          # Aug 1 - Sep 30
+    if md <= (10, 31):
+        return "halloween"        # all of October
+    if today <= thanksgiving_date(today.year):
+        return "thanksgiving"     # Nov 1 - Thanksgiving Day
+    return "christmas"            # day after Thanksgiving - Dec 25
+
+
+def find_icon(season):
+    for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        path = ICON_DIR / f"{season}{ext}"
+        if path.exists():
+            return path
+    return None
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+async def apply_season_icon(guild, season, force=False):
+    """Sets the guild icon for a season. Returns True if it changed."""
+    state = load_state()
+    if not force and state.get(str(guild.id)) == season:
+        return False
+
+    # First run: back up the server's current icon as the "normal" one
+    ICON_DIR.mkdir(exist_ok=True)
+    if find_icon("default") is None and guild.icon:
+        (ICON_DIR / "default.png").write_bytes(await guild.icon.with_format("png").read())
+        print(f"[icons] Saved {guild.name}'s current icon as icons/default.png")
+
+    path = find_icon(season)
+    if path is None:
+        print(f"[icons] No icon file for '{season}' in the icons folder, skipping")
+        return False
+
+    try:
+        await guild.edit(icon=path.read_bytes(), reason=f"Seasonal icon: {SEASON_NAMES[season]}")
+    except discord.Forbidden:
+        print(f"[icons] I need the Manage Server permission in {guild.name}")
+        return False
+    except discord.HTTPException as e:
+        print(f"[icons] Discord rejected {path.name}: {e}")
+        return False
+
+    state[str(guild.id)] = season
+    save_state(state)
+    print(f"[icons] {guild.name} icon set to {SEASON_NAMES[season]}")
+    return True
+
+
+@tasks.loop(hours=1)
+async def seasonal_icon_check():
+    season = current_season()
+    for guild in bot.guilds:
+        await apply_season_icon(guild, season)
+
+
+@seasonal_icon_check.before_loop
+async def before_icon_check():
+    await bot.wait_until_ready()
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def season(ctx):
+    """Shows which holiday icon season we're in."""
+    await ctx.send(f"🎉 Current season: **{SEASON_NAMES[current_season()]}**")
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
+async def seticon(ctx, image: discord.Attachment):
+    """Changes the server icon to an attached image (until the next season starts)."""
+    await ctx.defer()
+    image = await image.read()
+    try:
+        await ctx.guild.edit(icon=image, reason=f"Changed by {ctx.author}")
+    except discord.HTTPException:
+        await ctx.send("❌ Couldn't set that as the icon. Make sure it's a PNG, JPG or GIF.")
+        return
+    await ctx.send("Server icon updated.")
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
+async def refreshicon(ctx):
+    """Puts the current holiday icon back."""
+    await ctx.defer()
+    season = current_season()
+    if await apply_season_icon(ctx.guild, season, force=True):
+        await ctx.send(f"Icon reset to **{SEASON_NAMES[season]}**.")
+    else:
+        await ctx.send(f"❌ No icon file found for **{SEASON_NAMES[season]}** (or I'm missing permissions).")
+
+
+def root_error(error):
+    """Digs through the wrapper errors discord.py adds to find the real one."""
+    while hasattr(error, "original"):
+        error = error.original
+    return error
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need the Manage Server permission to do that.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"You're missing something. Usage: `!{ctx.command.name} {ctx.command.signature}`")
+    elif isinstance(error, commands.NotOwner):
+        await ctx.send("Only the bot owner can use that.", ephemeral=True)
+    elif isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("That only works in a server.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"That didn't look right. Usage: `!{ctx.command.name} {ctx.command.signature}`")
+    elif isinstance(error, commands.CommandNotFound):
+        return
+    elif isinstance(root_error(error), discord.Forbidden):
+        where = f"#{ctx.channel.name}" if ctx.guild else "here"
+        print(f"[permissions] /{ctx.command.name} in {where}: {root_error(error).text}")
+        try:
+            await ctx.author.send(f"❌ I don't have permission to do `/{ctx.command.name}` in {where}. "
+                                  f"Check my role's permissions for that channel (usually **Send Messages**).")
+        except discord.HTTPException:
+            pass
+    else:
+        raise error
+
+
+# ---------------- Soundboard spam ----------------
+# !spam <sound name> [times]  - joins your voice channel and spams that sound
+# !sounds                     - lists the sounds you can use
+# !stop                       - stops spamming and leaves the call
+
+SPAM_DEFAULT = 5      # how many times if you don't give a number
+SPAM_MAX = 100       # upper limit so it can't run forever
+SPAM_DELAY = 2.0      # seconds between sounds
+
+spam_tasks = {}            # guild id -> running spam task
+_default_sounds_cache = []
+
+
+async def all_sounds(guild):
+    """The server's own soundboard sounds plus Discord's built-in ones."""
+    global _default_sounds_cache
+    if not _default_sounds_cache:
+        try:
+            _default_sounds_cache = await bot.fetch_soundboard_default_sounds()
+        except discord.HTTPException:
+            pass
+    return list(guild.soundboard_sounds) + list(_default_sounds_cache)
+
+
+async def find_sound(guild, name):
+    sounds = await all_sounds(guild)
+    name = name.lower().strip()
+    for s in sounds:                      # exact name first
+        if s.name.lower() == name:
+            return s
+    for s in sounds:                      # then partial match
+        if name in s.name.lower():
+            return s
+    return None
+
+
+async def join_voice(ctx):
+    """Joins (or moves to) the command user's voice channel. Returns the voice client or None."""
+    target = ctx.author.voice.channel
+    vc = ctx.guild.voice_client
+    try:
+        if vc is None:
+            vc = await target.connect(self_deaf=False)
+        elif vc.channel != target:
+            await vc.move_to(target)
+    except RuntimeError:
+        await ctx.send("❌ Voice support isn't installed. Run: `venv\\Scripts\\python -m pip install \"discord.py[voice]\"`")
+        return None
+    except (discord.ClientException, asyncio.TimeoutError):
+        await ctx.send("❌ I couldn't join that voice channel.")
+        return None
+    return vc
+
+
+async def run_spam(ctx, voice_client, sound, times):
+    channel = voice_client.channel
+    try:
+        for _ in range(times):
+            await channel.send_sound(sound)
+            await asyncio.sleep(SPAM_DELAY)
+    except discord.Forbidden:
+        await ctx.send("❌ I need the **Speak** and **Use Soundboard** permissions in that channel.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Discord stopped the sound: {e.text or e}")
+    finally:
+        spam_tasks.pop(ctx.guild.id, None)
+        if voice_client.is_connected():
+            await voice_client.disconnect()
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@app_commands.describe(sound="Sound name, optionally followed by how many times, e.g. vine boom 10")
+async def spam(ctx, *, sound: str):
+    """Joins your call and spams a soundboard sound. Usage: !spam <sound> [times]"""
+    args = sound
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("Join a voice channel first.")
+        return
+    if ctx.guild.id in spam_tasks:
+        await ctx.send("I'm already spamming. Use `!stop` first.")
+        return
+
+    # A number at the end is how many times, e.g. "!spam vine boom 10"
+    parts = args.rsplit(" ", 1)
+    times = SPAM_DEFAULT
+    if len(parts) == 2 and parts[1].isdigit():
+        args, times = parts[0], int(parts[1])
+    times = max(1, min(times, SPAM_MAX))
+
+    await ctx.defer()
+    sound = await find_sound(ctx.guild, args)
+    if sound is None:
+        await ctx.send(f"❌ No sound called **{args}**. Use `!sounds` to see the list.")
+        return
+
+    target = ctx.author.voice.channel
+    vc = await join_voice(ctx)
+    if vc is None:
+        return
+
+    await ctx.send(f"🔊 Spamming **{sound.name}** {times} times in {target.mention}")
+    spam_tasks[ctx.guild.id] = asyncio.create_task(run_spam(ctx, vc, sound, times))
+
+
+@spam.autocomplete("sound")
+async def spam_sound_autocomplete(interaction, current: str):
+    names = sorted({s.name for s in await all_sounds(interaction.guild)})
+    matches = [n for n in names if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def stop(ctx):
+    """Stops the soundboard spam and leaves the call."""
+    task = spam_tasks.pop(ctx.guild.id, None)
+    if task:
+        task.cancel()
+    if ctx.guild.voice_client:
+        await ctx.guild.voice_client.disconnect()
+    await ctx.send("🛑 Stopped." if task else "Nothing was playing.")
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def sounds(ctx):
+    """Lists the soundboard sounds you can spam."""
+    server = [s.name for s in ctx.guild.soundboard_sounds]
+    await all_sounds(ctx.guild)
+    builtin = [s.name for s in _default_sounds_cache]
+    msg = "**Server sounds:** " + (", ".join(server) or "none")
+    msg += "\n**Built-in sounds:** " + (", ".join(builtin) or "none")
+    await ctx.send(msg[:2000])
+
+
+# ---------------- Text to speech ----------------
+# !tts <message>  - joins your voice channel and reads the message out loud
+# Needs:  pip install edge-tts   and FFmpeg installed on the computer
+
+TTS_MAX_CHARS = 300
+
+# Name people pick -> Microsoft voice ID ("edge-tts --list-voices" shows hundreds more)
+TTS_VOICES = {
+    "guy": "en-US-GuyNeural",
+    "aria": "en-US-AriaNeural",
+    "jenny": "en-US-JennyNeural",
+    "christopher": "en-US-ChristopherNeural",
+    "kid": "en-US-AnaNeural",
+    "british_man": "en-GB-RyanNeural",
+    "british_woman": "en-GB-SoniaNeural",
+    "aussie_man": "en-AU-WilliamNeural",
+    "aussie_woman": "en-AU-NatashaNeural",
+    "irish": "en-IE-ConnorNeural",
+    "indian": "en-IN-PrabhatNeural",
+}
+TTS_DEFAULT_VOICE = "guy"
+VoiceName = Literal[tuple(TTS_VOICES)]
+USER_VOICES_FILE = Path(__file__).parent / "tts_voices.json"
+
+
+def load_user_voices():
+    try:
+        return json.loads(USER_VOICES_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def voice_for(user_id, chosen=None):
+    """Voice for this message: the one picked now, else the user's saved one, else the default."""
+    if chosen:
+        return chosen
+    saved = load_user_voices().get(str(user_id))
+    return saved if saved in TTS_VOICES else TTS_DEFAULT_VOICE
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@app_commands.describe(text="What the bot should say", voice="Which voice to use (default: your /myvoice choice)")
+async def tts(ctx, voice: Optional[VoiceName] = None, *, text: commands.clean_content):
+    """Says your message out loud in your voice channel. Usage: !tts [voice] <message>"""
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("Join a voice channel first.")
+        return
+    if len(text) > TTS_MAX_CHARS:
+        await ctx.send(f"That's too long. Keep it under {TTS_MAX_CHARS} characters.")
+        return
+    try:
+        import edge_tts
+    except ImportError:
+        await ctx.send("❌ TTS isn't installed. Run: `venv\\Scripts\\python -m pip install edge-tts`")
+        return
+
+    await ctx.defer()
+    vc = await join_voice(ctx)
+    if vc is None:
+        return
+    if vc.is_playing():
+        await ctx.send("I'm already talking, wait a sec.")
+        return
+
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    try:
+        await edge_tts.Communicate(str(text), TTS_VOICES[voice_for(ctx.author.id, voice)]).save(path)
+        done = asyncio.Event()
+        try:
+            vc.play(discord.FFmpegPCMAudio(path),
+                    after=lambda e: bot.loop.call_soon_threadsafe(done.set))
+        except discord.ClientException:
+            await ctx.send("❌ FFmpeg isn't installed (or isn't on PATH), so I can't play audio.")
+            return
+        if ctx.interaction:
+            await ctx.send(f"🗣️ {text}")
+        else:
+            await ctx.message.add_reaction("🗣️")
+        await done.wait()
+    except Exception as e:
+        await ctx.send(f"❌ TTS failed: {e}")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        # leave the call unless !spam is using it
+        if ctx.guild.id not in spam_tasks and vc.is_connected():
+            await vc.disconnect()
+
+
+@bot.hybrid_command()
+@app_commands.describe(voice="Your new default voice (leave empty to see your current one)")
+async def myvoice(ctx, voice: Optional[VoiceName] = None):
+    """Sets the voice /tts uses for you by default."""
+    if voice is None:
+        await ctx.send(f"🗣️ Your TTS voice is **{voice_for(ctx.author.id)}**. "
+                       f"Change it with `/myvoice` (see `/voices` for options).")
+        return
+    saved = load_user_voices()
+    saved[str(ctx.author.id)] = voice
+    USER_VOICES_FILE.write_text(json.dumps(saved, indent=2))
+    await ctx.send(f"✅ Your TTS voice is now **{voice}**.")
+
+
+@bot.hybrid_command()
+async def voices(ctx):
+    """Lists the voices you can use with /tts."""
+    names = ", ".join(f"`{n}`" for n in TTS_VOICES)
+    await ctx.send(f"🗣️ **TTS voices:** {names}\nExample: `!tts british_man hello there`. Set your own default with `/myvoice`.")
+
+
+# ---------------- Twitch live alerts ----------------
+# Posts the stream link when the streamer goes live.
+# Needs TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in .env (free app at dev.twitch.tv)
+# Run !streamhere in the channel where alerts should go.
+
+TWITCH_STREAMER = "mtsuesports"
+STREAM_STATE_FILE = Path(__file__).parent / "stream_state.json"
+
+_twitch_token = None
+
+
+def load_stream_state():
+    try:
+        return json.loads(STREAM_STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_stream_state(state):
+    STREAM_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+async def get_twitch_token(session):
+    """Gets an app access token from Twitch using the client ID and secret."""
+    global _twitch_token
+    async with session.post("https://id.twitch.tv/oauth2/token", params={
+        "client_id": os.getenv("TWITCH_CLIENT_ID"),
+        "client_secret": os.getenv("TWITCH_CLIENT_SECRET"),
+        "grant_type": "client_credentials",
+    }) as resp:
+        resp.raise_for_status()
+        _twitch_token = (await resp.json())["access_token"]
+
+
+async def get_live_stream(streamer):
+    """Returns Twitch's info about the stream if they're live, otherwise None."""
+    async with aiohttp.ClientSession() as session:
+        if _twitch_token is None:
+            await get_twitch_token(session)
+        for attempt in range(2):
+            headers = {
+                "Client-ID": os.getenv("TWITCH_CLIENT_ID"),
+                "Authorization": f"Bearer {_twitch_token}",
+            }
+            async with session.get("https://api.twitch.tv/helix/streams",
+                                   params={"user_login": streamer}, headers=headers) as resp:
+                if resp.status == 401 and attempt == 0:   # token expired, get a new one
+                    await get_twitch_token(session)
+                    continue
+                resp.raise_for_status()
+                data = (await resp.json())["data"]
+                return data[0] if data else None
+
+
+@tasks.loop(minutes=2)
+async def twitch_check():
+    if not os.getenv("TWITCH_CLIENT_ID") or not os.getenv("TWITCH_CLIENT_SECRET"):
+        print("[twitch] TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET missing from .env, alerts are off")
+        twitch_check.cancel()
+        return
+
+    state = load_stream_state()
+    try:
+        stream = await get_live_stream(TWITCH_STREAMER)
+    except Exception as e:
+        print(f"[twitch] Couldn't check Twitch: {e}")
+        return
+
+    if stream is None:
+        return
+    if state.get("last_stream_id") == stream["id"]:
+        return   # already announced this stream
+
+    state["last_stream_id"] = stream["id"]
+    save_stream_state(state)
+
+    channel = bot.get_channel(state.get("channel_id", 0))
+    if channel is None:
+        print("[twitch] Streamer is live but no alert channel is set. Run !streamhere in Discord.")
+        return
+
+    title = stream.get("title") or ""
+    game = stream.get("game_name") or ""
+    msg = f"🔴 **{stream['user_name']}** is live!"
+    if title:
+        msg += f" *{title}*"
+    if game:
+        msg += f" ({game})"
+    msg += f"\nhttps://twitch.tv/{TWITCH_STREAMER}"
+    await channel.send(msg)
+    print(f"[twitch] Announced stream {stream['id']}")
+
+
+@twitch_check.before_loop
+async def before_twitch_check():
+    await bot.wait_until_ready()
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
+async def streamhere(ctx):
+    """Makes Twitch live alerts post in this channel."""
+    if not ctx.channel.permissions_for(ctx.guild.me).send_messages:
+        await ctx.author.send(f"❌ I need **Send Messages** in #{ctx.channel.name} to post live alerts there.")
+        return
+    state = load_stream_state()
+    state["channel_id"] = ctx.channel.id
+    save_stream_state(state)
+    await ctx.send(f"✅ Live alerts for **{TWITCH_STREAMER}** will post in {ctx.channel.mention}.")
+
+
+# ---------------- Snipe ----------------
+# Remembers the last deleted message in each channel (only in memory, gone on restart).
+
+last_deleted = {}   # channel id -> info about the deleted message
+
+
+@bot.event
+async def on_message_delete(message):
+    if message.guild is None or message.author.bot:
+        return
+    if not message.content and not message.attachments:
+        return
+    last_deleted[message.channel.id] = {
+        "author": message.author.display_name,
+        "avatar": message.author.display_avatar.url,
+        "content": message.content,
+        "attachments": len(message.attachments),
+        "time": message.created_at,
+    }
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def snipe(ctx):
+    """Shows the last deleted message in this channel."""
+    info = last_deleted.get(ctx.channel.id)
+    if info is None:
+        await ctx.send("Nothing to snipe here.")
+        return
+    embed = discord.Embed(description=info["content"] or "*no text*",
+                          color=discord.Color.red(), timestamp=info["time"])
+    embed.set_author(name=info["author"], icon_url=info["avatar"])
+    if info["attachments"]:
+        embed.set_footer(text=f"had {info['attachments']} attachment(s)")
+    await ctx.send(embed=embed)
+
+
+# ---------------- Quotes ----------------
+# /quotechannel (run in your quotes channel) tells the bot where the quotes are.
+# /quote posts a random message from that channel.
+
+QUOTES_FILE = Path(__file__).parent / "quotes.json"
+quote_ids = {}   # guild id -> list of message ids in the quotes channel (filled on first use)
+
+
+def load_quote_settings():
+    try:
+        return json.loads(QUOTES_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def quote_channel_for(guild):
+    channel_id = load_quote_settings().get(str(guild.id))
+    return guild.get_channel(channel_id) if channel_id else None
+
+
+def is_quotable(message):
+    return not message.author.bot and (message.content or message.attachments)
+
+
+async def load_quote_ids(channel):
+    ids = [m.id async for m in channel.history(limit=None) if is_quotable(m)]
+    quote_ids[channel.guild.id] = ids
+    return ids
+
+
+@bot.listen("on_message")
+async def remember_new_quote(message):
+    """Adds new messages in the quotes channel to the list without re-reading the whole channel."""
+    if message.guild is None or message.guild.id not in quote_ids or not is_quotable(message):
+        return
+    channel = quote_channel_for(message.guild)
+    if channel and message.channel.id == channel.id:
+        quote_ids[message.guild.id].append(message.id)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def quote(ctx):
+    """Posts a random quote from the quotes channel."""
+    channel = quote_channel_for(ctx.guild)
+    if channel is None:
+        await ctx.send("No quotes channel set yet. Someone with Manage Server can run `/quotechannel` in it.")
+        return
+    await ctx.defer()
+
+    try:
+        ids = quote_ids.get(ctx.guild.id) or await load_quote_ids(channel)
+    except discord.Forbidden:
+        await ctx.send(f"❌ I can't read {channel.mention}. I need **Read Message History** there.")
+        return
+
+    message = None
+    while ids and message is None:
+        pick = random.choice(ids)
+        try:
+            message = await channel.fetch_message(pick)   # fresh copy so images still load
+        except discord.NotFound:
+            ids.remove(pick)                              # quote was deleted
+    if message is None:
+        await ctx.send(f"{channel.mention} doesn't have any quotes yet.")
+        return
+
+    embed = discord.Embed(description=message.content or None, color=discord.Color.gold(),
+                          timestamp=message.created_at)
+    embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+    image = next((a for a in message.attachments
+                  if a.content_type and a.content_type.startswith("image/")), None)
+    if image:
+        embed.set_image(url=image.url)
+    embed.add_field(name="\u200b", value=f"[Jump to message]({message.jump_url})")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
+async def quotechannel(ctx):
+    """Makes this channel the one /quote picks from."""
+    if not ctx.channel.permissions_for(ctx.guild.me).read_message_history:
+        await ctx.author.send(f"❌ I need **Read Message History** in #{ctx.channel.name} to pick quotes from it.")
+        return
+    settings = load_quote_settings()
+    settings[str(ctx.guild.id)] = ctx.channel.id
+    QUOTES_FILE.write_text(json.dumps(settings, indent=2))
+    quote_ids.pop(ctx.guild.id, None)   # re-read the new channel next time
+    await ctx.send(f"✅ `/quote` will now pick from {ctx.channel.mention}.")
+
+
+# ---------------- Video to GIF ----------------
+# /gif <video> [start] [length] [width]   or reply to a video with !gif
+GIF_MAX_LENGTH = 10            # seconds
+GIF_MAX_DOWNLOAD = 50_000_000  # don't download videos bigger than 50 MB
+GIF_TIMEOUT = 180              # give up if FFmpeg takes longer than this (seconds)
+gif_lock = asyncio.Semaphore(1)   # one conversion at a time so the Pi doesn't melt
+
+
+def is_video(attachment):
+    if attachment.content_type and attachment.content_type.startswith("video/"):
+        return True
+    return attachment.filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"))
+
+
+# Meme-style fonts to try, in order (Impact on Windows, DejaVu Bold on the Pi)
+CAPTION_FONTS = [
+    "C:/Windows/Fonts/impact.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+CAPTION_MAX_CHARS = 100
+
+
+def ffmpeg_path(path):
+    """Writes a file path the way FFmpeg filters want it (forward slashes, escaped colon)."""
+    return str(path).replace("\\", "/").replace(":", "\\:")
+
+
+def caption_filters(caption, width, tmpdir):
+    """Builds drawtext filters: centered white text with a black outline, wrapped over lines."""
+    if not caption:
+        return ""
+    font = next((f for f in CAPTION_FONTS if os.path.exists(f)), None)
+    size = max(14, width // 11)
+    chars_per_line = max(8, int(width / (size * 0.55)))
+    parts = []
+    for i, line in enumerate(textwrap.wrap(caption, chars_per_line)[:4]):
+        # Text goes in a file so quotes/colons in the caption can't break the command
+        text_file = os.path.join(tmpdir, f"caption{i}.txt")
+        with open(text_file, "w", encoding="utf-8") as f:
+            f.write(line)
+        opts = [f"textfile='{ffmpeg_path(text_file)}'", f"fontsize={size}", "fontcolor=white",
+                f"borderw={max(2, size // 12)}", "bordercolor=black",
+                "x=(w-text_w)/2", f"y={int(size * 0.3 + i * size * 1.15)}"]
+        if font:
+            opts.insert(0, f"fontfile='{ffmpeg_path(font)}'")
+        parts.append("drawtext=" + ":".join(opts))
+    return "," + ",".join(parts)
+
+
+async def ffmpeg_to_gif(src, dst, start, length, width, fps, caption=None):
+    text = caption_filters(caption, width, os.path.dirname(dst))
+    filters = (f"fps={fps},scale={width}:-2:flags=lanczos{text},split[a][b];"
+               f"[a]palettegen=max_colors=256:stats_mode=diff[p];"
+               f"[b][p]paletteuse=dither=bayer:bayer_scale=5")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-loglevel", "error", "-ss", str(start), "-t", str(length), "-i", src,
+        "-vf", filters, "-loop", "0", dst,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=GIF_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError("took too long")
+    if proc.returncode != 0:
+        raise RuntimeError(err.decode(errors="replace").strip()[-300:] or "FFmpeg failed")
+
+
+@bot.hybrid_command()
+@app_commands.describe(video="The video to turn into a GIF",
+                       start="Where to start, in seconds (default 0)",
+                       length=f"How many seconds long (default 5, max {GIF_MAX_LENGTH})",
+                       width="Width in pixels (default 480)",
+                       caption="Text to put on top of the GIF (optional)")
+async def gif(ctx, video: Optional[discord.Attachment] = None, start: float = 0.0,
+              length: float = 5.0, width: app_commands.Range[int, 120, 720] = 480,
+              *, caption: Optional[str] = None):
+    """Turns a video into a GIF. Attach a video, or reply to one with !gif."""
+    # For !gif as a reply, use the video in the message being replied to
+    if video is None and ctx.message and ctx.message.reference:
+        ref = ctx.message.reference.resolved
+        if not isinstance(ref, discord.Message):
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+        video = next((a for a in ref.attachments if is_video(a)), None)
+    if video is None or not is_video(video):
+        await ctx.send("Attach a video, or reply to a message that has one.")
+        return
+    if video.size > GIF_MAX_DOWNLOAD:
+        await ctx.send("That video is too big (max 50 MB).")
+        return
+
+    if caption and len(caption) > CAPTION_MAX_CHARS:
+        await ctx.send(f"Caption's too long. Keep it under {CAPTION_MAX_CHARS} characters.")
+        return
+    start = max(0.0, start)
+    length = max(0.5, min(length, GIF_MAX_LENGTH))
+    limit = ctx.guild.filesize_limit if ctx.guild else 10 * 1024 * 1024
+
+    await ctx.defer()
+    if gif_lock.locked():
+        await ctx.send("⏳ Another GIF is being made, yours is next...")
+
+    async with gif_lock:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "input" + (Path(video.filename).suffix or ".mp4"))
+            dst = os.path.join(tmp, "output.gif")
+            await video.save(src)
+
+            # Try smaller sizes until the GIF fits under Discord's upload limit
+            attempts = [(width, 15), (int(width * 0.75), 12), (int(width * 0.5), 10)]
+            for w, fps in attempts:
+                try:
+                    await ffmpeg_to_gif(src, dst, start, length, w, fps, caption)
+                except FileNotFoundError:
+                    await ctx.send("❌ FFmpeg isn't installed (or isn't on PATH).")
+                    return
+                except RuntimeError as e:
+                    await ctx.send(f"❌ Couldn't convert that video: {e}")
+                    return
+                if os.path.exists(dst) and 0 < os.path.getsize(dst) <= limit:
+                    name = Path(video.filename).stem[:40] + ".gif"
+                    await ctx.send(file=discord.File(dst, filename=name))
+                    return
+
+    await ctx.send("❌ Even shrunk down, that GIF is too big for Discord. Try a shorter `length`.")
+
+
+# ---------------- Help ----------------
+# Commands are listed automatically using their descriptions (the """docstring""").
+# Add new command names to a category here; anything not listed shows under "Other".
+
+HELP_CATEGORIES = {
+    "🎉 Fun": ["hello", "ping", "ben", "bugfact", "weather", "snipe", "quote", "gif"],
+    "🔊 Voice": ["spam", "sounds", "stop", "tts", "voices", "myvoice"],
+    "🖼️ Server icon": ["season", "seticon", "refreshicon"],
+    "⚙️ Setup": ["quotechannel", "streamhere"],
+}
+ADMIN_COMMANDS = {"seticon", "refreshicon", "streamhere", "quotechannel"}
+OWNER_COMMANDS = {"restart", "update", "setstatus"}
+
+
+@bot.hybrid_command(name="help")
+async def help_command(ctx):
+    """Shows all of the bot's commands."""
+    embed = discord.Embed(title="🪳 Bot commands", color=discord.Color.orange(),
+                          description="Every command works with `/` or `!`. 🔒 = needs Manage Server.")
+    listed = set()
+    commands_by_name = {c.name: c for c in bot.commands
+                        if not c.hidden and c.name not in OWNER_COMMANDS}
+
+    def line(cmd):
+        lock = " 🔒" if cmd.name in ADMIN_COMMANDS else ""
+        usage = f" {cmd.signature}" if cmd.signature else ""
+        return f"`/{cmd.name}{usage}`{lock} - {cmd.short_doc or 'No description'}"
+
+    for category, names in HELP_CATEGORIES.items():
+        lines = [line(commands_by_name[n]) for n in names if n in commands_by_name]
+        listed.update(names)
+        if lines:
+            embed.add_field(name=category, value="\n".join(lines), inline=False)
+
+    other = [line(c) for name, c in sorted(commands_by_name.items())
+             if name not in listed and name != "help"]
+    if other:
+        embed.add_field(name="Other", value="\n".join(other), inline=False)
+
+    await ctx.send(embed=embed)
+
+
+# ---------------- Bot status ----------------
+STATUS_FILE = Path(__file__).parent / "bot_status.json"
+ACTIVITY_TYPES = {
+    "playing": discord.ActivityType.playing,
+    "watching": discord.ActivityType.watching,
+    "listening": discord.ActivityType.listening,
+    "competing": discord.ActivityType.competing,
+}
+
+
+def make_activity(kind, text):
+    if not text:
+        return None
+    if kind in ACTIVITY_TYPES:
+        return discord.Activity(type=ACTIVITY_TYPES[kind], name=text)
+    return discord.CustomActivity(name=text)   # plain status message
+
+
+async def apply_saved_status():
+    try:
+        saved = json.loads(STATUS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    await bot.change_presence(activity=make_activity(saved.get("kind"), saved.get("text")))
+
+
+@bot.hybrid_command()
+@commands.is_owner()
+@app_commands.describe(kind="Playing / Watching / Listening to / Competing in (leave empty for a plain message)",
+                       text="The status text (leave everything empty to clear it)")
+async def setstatus(ctx, kind: Optional[Literal["playing", "watching", "listening", "competing"]] = None,
+                    *, text: Optional[str] = None):
+    """(Owner only) Sets the bot's status message."""
+    if text and len(text) > 128:
+        await ctx.send("That's too long. Statuses can be up to 128 characters.", ephemeral=True)
+        return
+    await bot.change_presence(activity=make_activity(kind, text))
+    STATUS_FILE.write_text(json.dumps({"kind": kind, "text": text}))
+    if not text:
+        await ctx.send("✅ Status cleared.", ephemeral=True)
+    else:
+        label = {"playing": "Playing ", "watching": "Watching ", "listening": "Listening to ",
+                 "competing": "Competing in "}.get(kind, "")
+        await ctx.send(f"✅ Status set to: **{label}{text}**", ephemeral=True)
+
+
+# ---------------- Restart ----------------
+restart_requested = False
+
+
+@bot.hybrid_command()
+@commands.is_owner()
+async def restart(ctx):
+    """(Owner only) Restarts the bot."""
+    await ctx.send("🔄 Restarting...", ephemeral=True)
+    print("[restart] Restart requested by", ctx.author)
+    await restart_bot()
+
+
+async def restart_bot():
+    global restart_requested
+    restart_requested = True
+    await bot.close()
+
+
+BOT_DIR = Path(__file__).parent
+
+
+async def run_cmd(*args):
+    """Runs a program in the bot folder. Returns (exit code, output text)."""
+    proc = await asyncio.create_subprocess_exec(
+        *args, cwd=BOT_DIR,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+@bot.hybrid_command()
+@commands.is_owner()
+async def update(ctx):
+    """(Owner only) Pulls the latest code from GitHub and restarts."""
+    await ctx.defer(ephemeral=True)
+    try:
+        _, before = await run_cmd("git", "rev-parse", "HEAD")
+        code, output = await run_cmd("git", "pull", "--ff-only")
+    except FileNotFoundError:
+        await ctx.send("❌ git isn't installed on this computer.", ephemeral=True)
+        return
+    if code != 0:
+        await ctx.send(f"❌ git pull failed:\n```{output[-1500:]}```", ephemeral=True)
+        return
+
+    _, after = await run_cmd("git", "rev-parse", "HEAD")
+    if before == after:
+        await ctx.send("✅ Already up to date, nothing to restart.", ephemeral=True)
+        return
+
+    _, changed = await run_cmd("git", "diff", "--name-only", before, after)
+    _, log = await run_cmd("git", "log", "--oneline", f"{before}..{after}")
+    msg = f"⬇️ Pulled new code:\n```{log[:1200]}```"
+
+    if "requirements.txt" in changed.splitlines():
+        code, pip_out = await run_cmd(sys.executable, "-m", "pip", "install", "-r", "requirements.txt")
+        if code != 0:
+            await ctx.send(msg + f"\n❌ Installing requirements failed, not restarting:\n```{pip_out[-800:]}```",
+                           ephemeral=True)
+            return
+        msg += "\n📦 Installed new requirements."
+
+    await ctx.send(msg + "\n🔄 Restarting...", ephemeral=True)
+    print("[update] Updated to", after[:7], "- restarting")
+    await restart_bot()
+
+
 bot_token = os.getenv("DISCORD_TOKEN")
 bot.run(bot_token)
+
+if restart_requested:
+    # Start a fresh copy of the bot with the same command it was launched with
+    os.execv(sys.executable, [sys.executable] + sys.argv)
