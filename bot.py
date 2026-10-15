@@ -25,6 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 async def setup_hook():
     # Registers the / versions of the commands with Discord
+    bot.add_view(QuoteView())   # makes old "Another quote" buttons work after a restart
     synced = await bot.tree.sync()
     print(f"Synced {len(synced)} slash commands")
 
@@ -790,21 +791,15 @@ async def remember_new_quote(message):
         quote_ids[message.guild.id].append(message.id)
 
 
-@bot.hybrid_command()
-@commands.guild_only()
-async def quote(ctx):
-    """Posts a random quote from the quotes channel."""
-    channel = quote_channel_for(ctx.guild)
+async def make_quote(guild):
+    """Picks a random quote. Returns (embed, None) or (None, error message)."""
+    channel = quote_channel_for(guild)
     if channel is None:
-        await ctx.send("No quotes channel set yet. Someone with Manage Server can run `/quotechannel` in it.")
-        return
-    await ctx.defer()
-
+        return None, "No quotes channel set yet. Someone with Manage Server can run `/quotechannel` in it."
     try:
-        ids = quote_ids.get(ctx.guild.id) or await load_quote_ids(channel)
+        ids = quote_ids.get(guild.id) or await load_quote_ids(channel)
     except discord.Forbidden:
-        await ctx.send(f"❌ I can't read {channel.mention}. I need **Read Message History** there.")
-        return
+        return None, f"❌ I can't read {channel.mention}. I need **Read Message History** there."
 
     message = None
     while ids and message is None:
@@ -814,8 +809,7 @@ async def quote(ctx):
         except discord.NotFound:
             ids.remove(pick)                              # quote was deleted
     if message is None:
-        await ctx.send(f"{channel.mention} doesn't have any quotes yet.")
-        return
+        return None, f"{channel.mention} doesn't have any quotes yet."
 
     # Pair the quote with a "-Name" message posted right before/after it
     attribution = None
@@ -843,7 +837,42 @@ async def quote(ctx):
     if image:
         embed.set_image(url=image.url)
     embed.add_field(name="\u200b", value=f"[Jump to message]({message.jump_url})")
-    await ctx.send(embed=embed)
+    return embed, None
+
+
+class QuoteView(discord.ui.View):
+    """The 'Another quote' button. Persistent, so it keeps working after the bot restarts."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Another quote", style=discord.ButtonStyle.secondary,
+                       custom_id="roach:another_quote")
+    async def another(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            return
+        await interaction.response.defer()
+        embed, error = await make_quote(interaction.guild)
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+        try:
+            await interaction.message.edit(view=None)   # old quote loses its button
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(embed=embed, view=QuoteView())
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def quote(ctx):
+    """Posts a random quote from the quotes channel."""
+    await ctx.defer()
+    embed, error = await make_quote(ctx.guild)
+    if error:
+        await ctx.send(error)
+        return
+    await ctx.send(embed=embed, view=QuoteView())
 
 
 @bot.hybrid_command()
