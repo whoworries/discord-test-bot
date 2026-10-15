@@ -162,12 +162,14 @@ def current_season(today=None):
 
     if md >= (12, 26) or md == (1, 1):
         return "newyear"          # Dec 26 - Jan 1
+    if md < (1, 18):
+        return "default"          # Jan 2 - Jan 17
     if md <= (1, 25):
-        return "anniversary"      # Jan 2 - Jan 25
-    if md <= (2, 14):
-        return "valentines"       # Jan 26 - Feb 14
+        return "anniversary"      # Jan 18 - Jan 25 (week before the server anniversary)
+    if md < (2, 1):
+        return "default"          # Jan 26 - Jan 31
     if md < (3, 1):
-        return "default"          # Feb 15 - end of Feb
+        return "valentines"       # all of February
     if md <= (3, 17):
         return "stpatricks"       # Mar 1 - Mar 17
     if md == (4, 1):
@@ -579,6 +581,7 @@ async def voices(ctx):
 # Run !streamhere in the channel where alerts should go.
 
 TWITCH_STREAMER = "mtsuesports"
+TWITCH_GAMES = {"valorant"}   # only announce when streaming one of these (lowercase). Empty set = any game
 STREAM_STATE_FILE = Path(__file__).parent / "stream_state.json"
 
 _twitch_token = None
@@ -645,6 +648,8 @@ async def twitch_check():
         return
     if state.get("last_stream_id") == stream["id"]:
         return   # already announced this stream
+    if TWITCH_GAMES and (stream.get("game_name") or "").lower() not in TWITCH_GAMES:
+        return   # live, but not in VALORANT. Not marked as announced, so switching to it later still alerts
 
     state["last_stream_id"] = stream["id"]
     save_stream_state(state)
@@ -656,13 +661,15 @@ async def twitch_check():
 
     title = stream.get("title") or ""
     game = stream.get("game_name") or ""
-    msg = f"🔴 **{stream['user_name']}** is live!"
+    role = channel.guild.get_role(state.get("role_id", 0)) if channel.guild else None
+    msg = f"{role.mention} " if role else ""
+    msg += f"🔴 **{stream['user_name']}** is live!"
     if title:
         msg += f" *{title}*"
     if game:
         msg += f" ({game})"
     msg += f"\nhttps://twitch.tv/{TWITCH_STREAMER}"
-    await channel.send(msg)
+    await channel.send(msg, allowed_mentions=discord.AllowedMentions(roles=True))
     print(f"[twitch] Announced stream {stream['id']}")
 
 
@@ -675,15 +682,24 @@ async def before_twitch_check():
 @commands.guild_only()
 @commands.has_permissions(manage_guild=True)
 @app_commands.default_permissions(manage_guild=True)
-async def streamhere(ctx):
-    """Makes Twitch live alerts post in this channel."""
+@app_commands.describe(role="Role to ping when the stream goes live (optional)")
+async def streamhere(ctx, role: Optional[discord.Role] = None):
+    """Makes Twitch live alerts post in this channel, optionally pinging a role."""
     if not ctx.channel.permissions_for(ctx.guild.me).send_messages:
         await ctx.author.send(f"❌ I need **Send Messages** in #{ctx.channel.name} to post live alerts there.")
         return
     state = load_stream_state()
     state["channel_id"] = ctx.channel.id
+    if role is not None:
+        state["role_id"] = role.id
     save_stream_state(state)
-    await ctx.send(f"✅ Live alerts for **{TWITCH_STREAMER}** will post in {ctx.channel.mention}.")
+    saved_role = ctx.guild.get_role(state.get("role_id", 0))
+    msg = f"✅ Live alerts for **{TWITCH_STREAMER}** will post in {ctx.channel.mention}"
+    msg += f" and ping {saved_role.mention}." if saved_role else "."
+    if saved_role and not saved_role.mentionable and not ctx.channel.permissions_for(ctx.guild.me).mention_everyone:
+        msg += ("\n⚠️ I can't actually ping that role yet. Turn on **Allow anyone to @mention this role** "
+                "for it, or give me **Mention @everyone, @here, and All Roles**.")
+    await ctx.send(msg, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ---------------- Snipe ----------------
@@ -743,8 +759,19 @@ def quote_channel_for(guild):
     return guild.get_channel(channel_id) if channel_id else None
 
 
+ATTRIBUTION_MAX_GAP = datetime.timedelta(minutes=10)
+
+
+def is_attribution(message):
+    """A short follow-up like '-Name' that says who said the quote above it."""
+    text = (message.content or "").strip()
+    return (not message.attachments and text[:1] in ("-", "—", "–", "~")
+            and len(text) <= 40 and len(text.split()) <= 5)
+
+
 def is_quotable(message):
-    return not message.author.bot and (message.content or message.attachments)
+    return (not message.author.bot and (message.content or message.attachments)
+            and not is_attribution(message))
 
 
 async def load_quote_ids(channel):
@@ -790,7 +817,25 @@ async def quote(ctx):
         await ctx.send(f"{channel.mention} doesn't have any quotes yet.")
         return
 
-    embed = discord.Embed(description=message.content or None, color=discord.Color.gold(),
+    # Pair the quote with a "-Name" message posted right before/after it
+    attribution = None
+    if is_attribution(message):
+        attribution = message
+        async for before in channel.history(before=message, limit=1):
+            if message.created_at - before.created_at <= ATTRIBUTION_MAX_GAP:
+                message = before
+    else:
+        async for after in channel.history(after=message, limit=1, oldest_first=True):
+            if is_attribution(after) and after.created_at - message.created_at <= ATTRIBUTION_MAX_GAP:
+                attribution = after
+
+    text = message.content or ""
+    if attribution is not None and attribution.id != message.id:
+        name = attribution.content.strip().lstrip("-—–~ ").strip()
+        if name:
+            text = f"{text}\n\n— **{name}**" if text else f"— **{name}**"
+
+    embed = discord.Embed(description=text or None, color=discord.Color.gold(),
                           timestamp=message.created_at)
     embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
     image = next((a for a in message.attachments
