@@ -740,6 +740,27 @@ async def snipe(ctx):
     await ctx.send(embed=embed)
 
 
+# ---------------- Black Friday countdown ----------------
+def black_friday_date(year):
+    return thanksgiving_date(year) + datetime.timedelta(days=1)
+
+
+@bot.hybrid_command()
+async def countdown(ctx):
+    """Says how many days until Black Friday."""
+    today = datetime.date.today()
+    day = black_friday_date(today.year)
+    if today > day:
+        day = black_friday_date(today.year + 1)
+    days = (day - today).days
+    if days == 0:
+        await ctx.send("🛒 **It's Black Friday.**")
+    elif days == 1:
+        await ctx.send("🛒 **1 day** until Black Friday.")
+    else:
+        await ctx.send(f"🛒 **{days} days** until Black Friday ({day.strftime('%B %d').replace(' 0', ' ')}).")
+
+
 # ---------------- Quotes ----------------
 # /quotechannel (run in your quotes channel) tells the bot where the quotes are.
 # /quote posts a random message from that channel.
@@ -1025,7 +1046,7 @@ async def gif(ctx, video: Optional[discord.Attachment] = None, start: float = 0.
 # Add new command names to a category here; anything not listed shows under "Other".
 
 HELP_CATEGORIES = {
-    "🎉 Fun": ["hello", "ping", "ben", "bugfact", "weather", "snipe", "quote", "gif"],
+    "🎉 Fun": ["hello", "ping", "ben", "bugfact", "weather", "snipe", "quote", "gif", "countdown"],
     "🔊 Voice": ["spam", "sounds", "stop", "tts", "voices", "myvoice"],
     "🖼️ Server icon": ["season", "seticon", "refreshicon"],
     "⚙️ Setup": ["quotechannel", "streamhere"],
