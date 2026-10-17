@@ -49,7 +49,7 @@ async def hello(ctx):
 @bot.hybrid_command()
 async def ping(ctx):
     """Shows the bot's response time."""
-    await ctx.send(f"Pong! 🏓 {round(bot.latency * 1000)}ms")
+    await ctx.send(f"Pong! 🏓 {round(bot.latency * 1000)}ms", ephemeral=True)
 
 @bot.hybrid_command()
 async def ben(ctx):
@@ -270,14 +270,14 @@ async def season(ctx):
 @app_commands.default_permissions(manage_guild=True)
 async def seticon(ctx, image: discord.Attachment):
     """Changes the server icon to an attached image (until the next season starts)."""
-    await ctx.defer()
+    await ctx.defer(ephemeral=True)
     image = await image.read()
     try:
         await ctx.guild.edit(icon=image, reason=f"Changed by {ctx.author}")
     except discord.HTTPException:
-        await ctx.send("❌ Couldn't set that as the icon. Make sure it's a PNG, JPG or GIF.")
+        await ctx.send("❌ Couldn't set that as the icon. Make sure it's a PNG, JPG or GIF.", ephemeral=True)
         return
-    await ctx.send("Server icon updated.")
+    await ctx.send("Server icon updated.", ephemeral=True)
 
 
 @bot.hybrid_command()
@@ -286,12 +286,12 @@ async def seticon(ctx, image: discord.Attachment):
 @app_commands.default_permissions(manage_guild=True)
 async def refreshicon(ctx):
     """Puts the current holiday icon back."""
-    await ctx.defer()
+    await ctx.defer(ephemeral=True)
     season = current_season()
     if await apply_season_icon(ctx.guild, season, force=True):
-        await ctx.send(f"Icon reset to **{SEASON_NAMES[season]}**.")
+        await ctx.send(f"Icon reset to **{SEASON_NAMES[season]}**.", ephemeral=True)
     else:
-        await ctx.send(f"❌ No icon file found for **{SEASON_NAMES[season]}** (or I'm missing permissions).")
+        await ctx.send(f"❌ No icon file found for **{SEASON_NAMES[season]}** (or I'm missing permissions).", ephemeral=True)
 
 
 def root_error(error):
@@ -304,15 +304,15 @@ def root_error(error):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You need the Manage Server permission to do that.")
+        await ctx.send("You need the Manage Server permission to do that.", ephemeral=True)
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"You're missing something. Usage: `!{ctx.command.name} {ctx.command.signature}`")
+        await ctx.send(f"You're missing something. Usage: `!{ctx.command.name} {ctx.command.signature}`", ephemeral=True)
     elif isinstance(error, commands.NotOwner):
         await ctx.send("Only the bot owner can use that.", ephemeral=True)
     elif isinstance(error, commands.NoPrivateMessage):
-        await ctx.send("That only works in a server.")
+        await ctx.send("That only works in a server.", ephemeral=True)
     elif isinstance(error, commands.BadArgument):
-        await ctx.send(f"That didn't look right. Usage: `!{ctx.command.name} {ctx.command.signature}`")
+        await ctx.send(f"That didn't look right. Usage: `!{ctx.command.name} {ctx.command.signature}`", ephemeral=True)
     elif isinstance(error, commands.CommandNotFound):
         return
     elif isinstance(root_error(error), discord.Forbidden):
@@ -404,10 +404,10 @@ async def spam(ctx, *, sound: str):
     """Joins your call and spams a soundboard sound. Usage: !spam <sound> [times]"""
     args = sound
     if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("Join a voice channel first.")
+        await ctx.send("Join a voice channel first.", ephemeral=True)
         return
     if ctx.guild.id in spam_tasks:
-        await ctx.send("I'm already spamming. Use `!stop` first.")
+        await ctx.send("I'm already spamming. Use `!stop` first.", ephemeral=True)
         return
 
     # A number at the end is how many times, e.g. "!spam vine boom 10"
@@ -417,11 +417,11 @@ async def spam(ctx, *, sound: str):
         args, times = parts[0], int(parts[1])
     times = max(1, min(times, SPAM_MAX))
 
-    await ctx.defer()
     sound = await find_sound(ctx.guild, args)
     if sound is None:
-        await ctx.send(f"❌ No sound called **{args}**. Use `!sounds` to see the list.")
+        await ctx.send(f"❌ No sound called **{args}**. Use `/sounds` to see the list.", ephemeral=True)
         return
+    await ctx.defer()
 
     target = ctx.author.voice.channel
     vc = await join_voice(ctx)
@@ -450,7 +450,10 @@ async def stop(ctx):
     was_connected = ctx.guild.voice_client is not None
     if was_connected:
         await ctx.guild.voice_client.disconnect()
-    await ctx.send("🛑 Stopped." if task else ("👋 Left the call." if was_connected else "Nothing was playing."))
+    if task or was_connected:
+        await ctx.send("🛑 Stopped." if task else "👋 Left the call.")
+    else:
+        await ctx.send("Nothing was playing.", ephemeral=True)
 
 
 @bot.hybrid_command()
@@ -462,7 +465,7 @@ async def sounds(ctx):
     builtin = [s.name for s in _default_sounds_cache]
     msg = "**Server sounds:** " + (", ".join(server) or "none")
     msg += "\n**Built-in sounds:** " + (", ".join(builtin) or "none")
-    await ctx.send(msg[:2000])
+    await ctx.send(msg[:2000], ephemeral=True)
 
 
 # ---------------- Text to speech ----------------
@@ -532,15 +535,15 @@ def voice_for(user_id, chosen=None):
 async def tts(ctx, voice: Optional[VoiceName] = None, *, text: commands.clean_content):
     """Says your message out loud in your voice channel. Usage: !tts [voice] <message>"""
     if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("Join a voice channel first.")
+        await ctx.send("Join a voice channel first.", ephemeral=True)
         return
     if len(text) > TTS_MAX_CHARS:
-        await ctx.send(f"That's too long. Keep it under {TTS_MAX_CHARS} characters.")
+        await ctx.send(f"That's too long. Keep it under {TTS_MAX_CHARS} characters.", ephemeral=True)
         return
     try:
         import edge_tts
     except ImportError:
-        await ctx.send("❌ TTS isn't installed. Run: `venv\\Scripts\\python -m pip install edge-tts`")
+        await ctx.send("❌ TTS isn't installed. Run: `venv\\Scripts\\python -m pip install edge-tts`", ephemeral=True)
         return
 
     await ctx.defer()
@@ -590,19 +593,19 @@ async def myvoice(ctx, voice: Optional[VoiceName] = None):
     """Sets the voice /tts uses for you by default."""
     if voice is None:
         await ctx.send(f"🗣️ Your TTS voice is **{voice_for(ctx.author.id)}**. "
-                       f"Change it with `/myvoice` (see `/voices` for options).")
+                       f"Change it with `/myvoice` (see `/voices` for options).", ephemeral=True)
         return
     saved = load_user_voices()
     saved[str(ctx.author.id)] = voice
     USER_VOICES_FILE.write_text(json.dumps(saved, indent=2))
-    await ctx.send(f"✅ Your TTS voice is now **{voice}**.")
+    await ctx.send(f"✅ Your TTS voice is now **{voice}**.", ephemeral=True)
 
 
 @bot.hybrid_command()
 async def voices(ctx):
     """Lists the voices you can use with /tts."""
     names = ", ".join(f"`{n}`" for n in TTS_VOICES)
-    await ctx.send(f"🗣️ **TTS voices:** {names}\nExample: `!tts british_man hello there`. Set your own default with `/myvoice`.")
+    await ctx.send(f"🗣️ **TTS voices:** {names}\nExample: `!tts british_man hello there`. Set your own default with `/myvoice`.", ephemeral=True)
 
 
 # ---------------- Twitch live alerts ----------------
@@ -729,7 +732,7 @@ async def streamhere(ctx, role: Optional[discord.Role] = None):
     if saved_role and not saved_role.mentionable and not ctx.channel.permissions_for(ctx.guild.me).mention_everyone:
         msg += ("\n⚠️ I can't actually ping that role yet. Turn on **Allow anyone to @mention this role** "
                 "for it, or give me **Mention @everyone, @here, and All Roles**.")
-    await ctx.send(msg, allowed_mentions=discord.AllowedMentions.none())
+    await ctx.send(msg, allowed_mentions=discord.AllowedMentions.none(), ephemeral=True)
 
 
 # ---------------- Snipe ----------------
@@ -917,6 +920,10 @@ class QuoteView(discord.ui.View):
 @commands.guild_only()
 async def quote(ctx):
     """Posts a random quote from the quotes channel."""
+    if quote_channel_for(ctx.guild) is None:
+        await ctx.send("No quotes channel set yet. Someone with Manage Server can run `/quotechannel` in it.",
+                       ephemeral=True)
+        return
     await ctx.defer()
     embed, error = await make_quote(ctx.guild)
     if error:
@@ -938,7 +945,7 @@ async def quotechannel(ctx):
     settings[str(ctx.guild.id)] = ctx.channel.id
     QUOTES_FILE.write_text(json.dumps(settings, indent=2))
     quote_ids.pop(ctx.guild.id, None)   # re-read the new channel next time
-    await ctx.send(f"✅ `/quote` will now pick from {ctx.channel.mention}.")
+    await ctx.send(f"✅ `/quote` will now pick from {ctx.channel.mention}.", ephemeral=True)
 
 
 # ---------------- Video to GIF ----------------
@@ -1028,14 +1035,14 @@ async def gif(ctx, video: Optional[discord.Attachment] = None, start: float = 0.
             ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
         video = next((a for a in ref.attachments if is_video(a)), None)
     if video is None or not is_video(video):
-        await ctx.send("Attach a video, or reply to a message that has one.")
+        await ctx.send("Attach a video, or reply to a message that has one.", ephemeral=True)
         return
     if video.size > GIF_MAX_DOWNLOAD:
-        await ctx.send("That video is too big (max 50 MB).")
+        await ctx.send("That video is too big (max 50 MB).", ephemeral=True)
         return
 
     if caption and len(caption) > CAPTION_MAX_CHARS:
-        await ctx.send(f"Caption's too long. Keep it under {CAPTION_MAX_CHARS} characters.")
+        await ctx.send(f"Caption's too long. Keep it under {CAPTION_MAX_CHARS} characters.", ephemeral=True)
         return
     start = max(0.0, start)
     length = max(0.5, min(length, GIF_MAX_LENGTH))
@@ -1126,7 +1133,7 @@ async def tweet(ctx):
     """Posts a random tweet from @ractingting."""
     link = random_tweet_link()
     if link is None:
-        await ctx.send("No tweets loaded yet. Run import_tweets.py on the archive's tweets.js.")
+        await ctx.send("No tweets loaded yet. Run import_tweets.py on the archive's tweets.js.", ephemeral=True)
         return
     await ctx.send(link, view=TweetView())
 
@@ -1170,7 +1177,7 @@ async def help_command(ctx):
     if other:
         embed.add_field(name="Other", value="\n".join(other), inline=False)
 
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, ephemeral=True)
 
 
 # ---------------- Bot status ----------------
