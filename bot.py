@@ -1082,6 +1082,7 @@ async def gif(ctx, video: Optional[discord.Attachment] = None, start: float = 0.
 # made by running import_tweets.py on the account's archive (data/tweets.js).
 
 TWEET_HANDLE = "ractingting"
+TWEET_EMBED_DOMAIN = "fixupx.com"   # alternatives: fxtwitter.com, vxtwitter.com
 TWEETS_FILE = Path(__file__).parent / "tweets.json"
 _tweets_cache = {"mtime": None, "tweets": []}
 
@@ -1105,7 +1106,8 @@ def random_tweet_link():
     tweets = load_tweets()
     if not tweets:
         return None
-    return f"https://x.com/{TWEET_HANDLE}/status/{random.choice(tweets)['id']}"
+    # fixupx.com gives Discord a proper preview (X's own links often show a blank "X on X" card)
+    return f"https://{TWEET_EMBED_DOMAIN}/{TWEET_HANDLE}/status/{random.choice(tweets)['id']}"
 
 
 class TweetView(discord.ui.View):
