@@ -1108,8 +1108,8 @@ def random_tweet_link():
         return None
     # fixupx.com gives Discord a proper preview (X's own links often show a blank "X on X" card)
     url = f"https://{TWEET_EMBED_DOMAIN}/{TWEET_HANDLE}/status/{random.choice(tweets)['id']}"
-    # Masked link with invisible text: Discord still shows the preview, but not the URL above it
-    return f"[\u200b]({url})"
+    # Small gray "view on X" link instead of the full URL; Discord still shows the preview under it
+    return f"-# [view on X]({url})"
 
 
 class TweetView(discord.ui.View):
