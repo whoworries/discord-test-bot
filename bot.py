@@ -26,6 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 async def setup_hook():
     # Registers the / versions of the commands with Discord
     bot.add_view(QuoteView())   # makes old "Another quote" buttons work after a restart
+    bot.add_view(TweetView())
     synced = await bot.tree.sync()
     print(f"Synced {len(synced)} slash commands")
 
@@ -445,9 +446,11 @@ async def stop(ctx):
     task = spam_tasks.pop(ctx.guild.id, None)
     if task:
         task.cancel()
-    if ctx.guild.voice_client:
+    cancel_tts_leave(ctx.guild.id)
+    was_connected = ctx.guild.voice_client is not None
+    if was_connected:
         await ctx.guild.voice_client.disconnect()
-    await ctx.send("🛑 Stopped." if task else "Nothing was playing.")
+    await ctx.send("🛑 Stopped." if task else ("👋 Left the call." if was_connected else "Nothing was playing."))
 
 
 @bot.hybrid_command()
@@ -467,6 +470,27 @@ async def sounds(ctx):
 # Needs:  pip install edge-tts   and FFmpeg installed on the computer
 
 TTS_MAX_CHARS = 300
+TTS_STAY_SECONDS = 60   # how long the bot hangs around in the call after the last TTS message
+tts_leave_tasks = {}    # guild id -> pending "leave the call" timer
+
+
+def cancel_tts_leave(guild_id):
+    task = tts_leave_tasks.pop(guild_id, None)
+    if task:
+        task.cancel()
+
+
+async def leave_after_idle(guild_id, vc):
+    """Leaves the call once nobody has used TTS for TTS_STAY_SECONDS (unless /spam is running)."""
+    try:
+        await asyncio.sleep(TTS_STAY_SECONDS)
+        if guild_id not in spam_tasks and vc.is_connected() and not vc.is_playing():
+            await vc.disconnect()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if tts_leave_tasks.get(guild_id) is asyncio.current_task():
+            tts_leave_tasks.pop(guild_id, None)
 
 # Name people pick -> Microsoft voice ID ("edge-tts --list-voices" shows hundreds more)
 TTS_VOICES = {
@@ -502,7 +526,7 @@ def voice_for(user_id, chosen=None):
     return saved if saved in TTS_VOICES else TTS_DEFAULT_VOICE
 
 
-@bot.hybrid_command()
+@bot.hybrid_command(usage="[voice] <message>")
 @commands.guild_only()
 @app_commands.describe(text="What the bot should say", voice="Which voice to use (default: your /myvoice choice)")
 async def tts(ctx, voice: Optional[VoiceName] = None, *, text: commands.clean_content):
@@ -520,11 +544,13 @@ async def tts(ctx, voice: Optional[VoiceName] = None, *, text: commands.clean_co
         return
 
     await ctx.defer()
+    cancel_tts_leave(ctx.guild.id)   # don't leave while we're about to talk
     vc = await join_voice(ctx)
     if vc is None:
         return
     if vc.is_playing():
         await ctx.send("I'm already talking, wait a sec.")
+        tts_leave_tasks[ctx.guild.id] = asyncio.create_task(leave_after_idle(ctx.guild.id, vc))
         return
 
     fd, path = tempfile.mkstemp(suffix=".mp3")
@@ -533,7 +559,8 @@ async def tts(ctx, voice: Optional[VoiceName] = None, *, text: commands.clean_co
         await edge_tts.Communicate(str(text), TTS_VOICES[voice_for(ctx.author.id, voice)]).save(path)
         done = asyncio.Event()
         try:
-            vc.play(discord.FFmpegPCMAudio(path),
+            # apad adds a little silence at the end so the last word isn't clipped
+            vc.play(discord.FFmpegPCMAudio(path, options="-af apad=pad_dur=0.75"),
                     after=lambda e: bot.loop.call_soon_threadsafe(done.set))
         except discord.ClientException:
             await ctx.send("❌ FFmpeg isn't installed (or isn't on PATH), so I can't play audio.")
@@ -543,6 +570,7 @@ async def tts(ctx, voice: Optional[VoiceName] = None, *, text: commands.clean_co
         else:
             await ctx.message.add_reaction("🗣️")
         await done.wait()
+        await asyncio.sleep(1)   # let the last bit of audio reach Discord
     except Exception as e:
         await ctx.send(f"❌ TTS failed: {e}")
     finally:
@@ -550,12 +578,13 @@ async def tts(ctx, voice: Optional[VoiceName] = None, *, text: commands.clean_co
             os.remove(path)
         except OSError:
             pass
-        # leave the call unless !spam is using it
-        if ctx.guild.id not in spam_tasks and vc.is_connected():
-            await vc.disconnect()
+        # stay in the call for a bit so back-to-back TTS doesn't leave/rejoin
+        if vc.is_connected():
+            cancel_tts_leave(ctx.guild.id)
+            tts_leave_tasks[ctx.guild.id] = asyncio.create_task(leave_after_idle(ctx.guild.id, vc))
 
 
-@bot.hybrid_command()
+@bot.hybrid_command(usage="[voice]")
 @app_commands.describe(voice="Your new default voice (leave empty to see your current one)")
 async def myvoice(ctx, voice: Optional[VoiceName] = None):
     """Sets the voice /tts uses for you by default."""
@@ -1041,12 +1070,73 @@ async def gif(ctx, video: Optional[discord.Attachment] = None, start: float = 0.
     await ctx.send("❌ Even shrunk down, that GIF is too big for Discord. Try a shorter `length`.")
 
 
+# ---------------- Tweets ----------------
+# /tweet posts a random tweet from @ractingting. The tweets come from tweets.json,
+# made by running import_tweets.py on the account's archive (data/tweets.js).
+
+TWEET_HANDLE = "ractingting"
+TWEETS_FILE = Path(__file__).parent / "tweets.json"
+_tweets_cache = {"mtime": None, "tweets": []}
+
+
+def load_tweets():
+    """Reads tweets.json, re-reading it only if the file changed (e.g. after a new import)."""
+    try:
+        mtime = TWEETS_FILE.stat().st_mtime
+    except FileNotFoundError:
+        return []
+    if _tweets_cache["mtime"] != mtime:
+        try:
+            _tweets_cache["tweets"] = json.loads(TWEETS_FILE.read_text(encoding="utf-8"))
+            _tweets_cache["mtime"] = mtime
+        except json.JSONDecodeError:
+            return _tweets_cache["tweets"]
+    return _tweets_cache["tweets"]
+
+
+def random_tweet_link():
+    tweets = load_tweets()
+    if not tweets:
+        return None
+    return f"https://x.com/{TWEET_HANDLE}/status/{random.choice(tweets)['id']}"
+
+
+class TweetView(discord.ui.View):
+    """The 'Another tweet' button. Persistent, so it keeps working after restarts."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Another tweet", style=discord.ButtonStyle.secondary,
+                       custom_id="roach:another_tweet")
+    async def another(self, interaction: discord.Interaction, button: discord.ui.Button):
+        link = random_tweet_link()
+        if link is None:
+            await interaction.response.send_message("No tweets loaded.", ephemeral=True)
+            return
+        await interaction.response.send_message(link, view=TweetView())
+        try:
+            await interaction.message.edit(view=None)   # old tweet loses its button
+        except discord.HTTPException:
+            pass
+
+
+@bot.hybrid_command()
+async def tweet(ctx):
+    """Posts a random tweet from @ractingting."""
+    link = random_tweet_link()
+    if link is None:
+        await ctx.send("No tweets loaded yet. Run import_tweets.py on the archive's tweets.js.")
+        return
+    await ctx.send(link, view=TweetView())
+
+
 # ---------------- Help ----------------
 # Commands are listed automatically using their descriptions (the """docstring""").
 # Add new command names to a category here; anything not listed shows under "Other".
 
 HELP_CATEGORIES = {
-    "🎉 Fun": ["hello", "ping", "ben", "bugfact", "weather", "snipe", "quote", "gif", "countdown"],
+    "🎉 Fun": ["hello", "ping", "ben", "bugfact", "weather", "snipe", "quote", "tweet", "gif", "countdown"],
     "🔊 Voice": ["spam", "sounds", "stop", "tts", "voices", "myvoice"],
     "🖼️ Server icon": ["season", "seticon", "refreshicon"],
     "⚙️ Setup": ["quotechannel", "streamhere"],
