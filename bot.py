@@ -692,8 +692,9 @@ async def twitch_check():
         print("[twitch] Streamer is live but no alert channel is set. Run !streamhere in Discord.")
         return
 
-    title = stream.get("title") or ""
-    game = stream.get("game_name") or ""
+    # escape so "||" in titles (e.g. NECC streams) doesn't turn into a spoiler box
+    title = discord.utils.escape_markdown(stream.get("title") or "")
+    game = discord.utils.escape_markdown(stream.get("game_name") or "")
     role = channel.guild.get_role(state.get("role_id", 0)) if channel.guild else None
     msg = f"{role.mention} " if role else ""
     msg += f"🔴 **{stream['user_name']}** is live!"
