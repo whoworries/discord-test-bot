@@ -614,7 +614,7 @@ async def voices(ctx):
 # Run !streamhere in the channel where alerts should go.
 
 TWITCH_STREAMER = "mtsuesports"
-TWITCH_GAMES = {"valorant"}   # only announce when streaming one of these (lowercase). Empty set = any game
+TWITCH_GAMES = {"valorant", "deadlock"}   # only announce when streaming one of these (lowercase). Empty set = any game
 STREAM_STATE_FILE = Path(__file__).parent / "stream_state.json"
 
 _twitch_token = None
@@ -682,7 +682,7 @@ async def twitch_check():
     if state.get("last_stream_id") == stream["id"]:
         return   # already announced this stream
     if TWITCH_GAMES and (stream.get("game_name") or "").lower() not in TWITCH_GAMES:
-        return   # live, but not in VALORANT. Not marked as announced, so switching to it later still alerts
+        return   # live, but not in one of TWITCH_GAMES. Not marked as announced, so switching to it later still alerts
 
     state["last_stream_id"] = stream["id"]
     save_stream_state(state)
