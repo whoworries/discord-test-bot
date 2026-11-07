@@ -663,6 +663,24 @@ async def get_live_stream(streamer):
                 return data[0] if data else None
 
 
+async def delete_old_alert(state):
+    """Deletes the last live alert (if there is one) and forgets it."""
+    channel_id, message_id = state.pop("alert_channel_id", None), state.pop("alert_message_id", None)
+    save_stream_state(state)
+    if not channel_id or not message_id:
+        return
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        return
+    try:
+        await channel.get_partial_message(message_id).delete()
+        print("[twitch] Stream ended, deleted the live alert")
+    except discord.NotFound:
+        pass   # someone already deleted it
+    except discord.HTTPException as e:
+        print(f"[twitch] Couldn't delete the old alert: {e}")
+
+
 @tasks.loop(minutes=2)
 async def twitch_check():
     if not os.getenv("TWITCH_CLIENT_ID") or not os.getenv("TWITCH_CLIENT_SECRET"):
@@ -678,6 +696,8 @@ async def twitch_check():
         return
 
     if stream is None:
+        if state.get("alert_message_id"):
+            await delete_old_alert(state)   # stream is over, take the alert down
         return
     if state.get("last_stream_id") == stream["id"]:
         return   # already announced this stream
@@ -703,7 +723,11 @@ async def twitch_check():
     if game:
         msg += f" ({game})"
     msg += f"\nhttps://twitch.tv/{TWITCH_STREAMER}"
-    await channel.send(msg, allowed_mentions=discord.AllowedMentions(roles=True))
+    if state.get("alert_message_id"):
+        await delete_old_alert(state)   # leftover alert from an earlier stream
+    sent = await channel.send(msg, allowed_mentions=discord.AllowedMentions(roles=True))
+    state["alert_channel_id"], state["alert_message_id"] = channel.id, sent.id
+    save_stream_state(state)
     print(f"[twitch] Announced stream {stream['id']}")
 
 
